@@ -1,4 +1,4 @@
-# Stackmaker patches (Mem0 fork)
+# ElefAI Brain patches (Mem0 fork)
 
 Este repositório (`Elefai/elefaibrain`) é um fork do upstream `mem0ai/mem0`, com hotfixes aplicados para melhorar estabilidade do servidor self-hosted (principalmente `pgvector/Postgres` e `Neo4j`).
 
@@ -7,7 +7,7 @@ Este repositório (`Elefai/elefaibrain`) é um fork do upstream `mem0ai/mem0`, c
 - O build instala `mem0ai` via `server/requirements.txt` (atualmente `mem0ai==1.0.1`).
 - Em seguida o `server/Dockerfile` sobrescreve alguns arquivos dentro do `site-packages/mem0/` com as versões deste repo.
 
-Isso existe para manter o servidor REST estável em produção no Swarm (quando usado com o Stackmaker).
+Isso existe para manter o servidor REST estável em produção no Swarm (no deploy do ElefAI Brain).
 
 ## Patches aplicados (hotfix)
 
