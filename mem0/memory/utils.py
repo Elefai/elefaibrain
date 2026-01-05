@@ -200,9 +200,17 @@ def sanitize_relationship_for_cypher(relationship) -> str:
     }
 
     # Apply replacements and clean up
-    sanitized = relationship
+    sanitized = str(relationship).strip().lower()
     for old, new in char_map.items():
         sanitized = sanitized.replace(old, new)
 
-    return re.sub(r"_+", "_", sanitized).strip("_")
+    # Hyphens are common but invalid in Cypher relationship type tokens.
+    sanitized = sanitized.replace("-", "_dash_")
 
+    sanitized = re.sub(r"[^0-9a-zA-Z_]", "_", sanitized)
+    sanitized = re.sub(r"_+", "_", sanitized).strip("_")
+    if not sanitized:
+        sanitized = "related_to"
+    if sanitized[0].isdigit():
+        sanitized = f"rel_{sanitized}"
+    return sanitized

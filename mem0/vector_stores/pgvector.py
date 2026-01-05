@@ -7,16 +7,20 @@ from pydantic import BaseModel
 
 # Try to import psycopg (psycopg3) first, then fall back to psycopg2
 try:
+    import psycopg
     from psycopg.types.json import Json
     from psycopg_pool import ConnectionPool
     PSYCOPG_VERSION = 3
+    OperationalError = psycopg.OperationalError
     logger = logging.getLogger(__name__)
     logger.info("Using psycopg (psycopg3) with ConnectionPool for PostgreSQL connections")
 except ImportError:
     try:
+        import psycopg2
         from psycopg2.extras import Json, execute_values
         from psycopg2.pool import ThreadedConnectionPool as ConnectionPool
         PSYCOPG_VERSION = 2
+        OperationalError = psycopg2.OperationalError
         logger = logging.getLogger(__name__)
         logger.info("Using psycopg2 with ThreadedConnectionPool for PostgreSQL connections")
     except ImportError:
@@ -101,7 +105,16 @@ class PGVector(VectorStoreBase):
         if self.connection_pool is None:
             if PSYCOPG_VERSION == 3:
                 # psycopg3 ConnectionPool
-                self.connection_pool = ConnectionPool(conninfo=connection_string, min_size=minconn, max_size=maxconn, open=True)
+                def _check(conn):
+                    conn.execute("SELECT 1")
+
+                self.connection_pool = ConnectionPool(
+                    conninfo=connection_string,
+                    min_size=minconn,
+                    max_size=maxconn,
+                    open=True,
+                    check=_check,
+                )
             else:
                 # psycopg2 ThreadedConnectionPool
                 self.connection_pool = ConnectionPool(minconn=minconn, maxconn=maxconn, dsn=connection_string)
@@ -124,10 +137,14 @@ class PGVector(VectorStoreBase):
                         yield cur
                         if commit:
                             conn.commit()
-                    except Exception:
-                        conn.rollback()
+                    except Exception as exc:
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            # Connection might already be broken; avoid masking the original error.
+                            pass
                         logger.error("Error in cursor context (psycopg3)", exc_info=True)
-                        raise
+                        raise exc
         else:
             # psycopg2 manual getconn/putconn
             conn = self.connection_pool.getconn()
@@ -137,12 +154,35 @@ class PGVector(VectorStoreBase):
                 if commit:
                     conn.commit()
             except Exception as exc:
-                conn.rollback()
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
                 logger.error(f"Error occurred: {exc}")
                 raise exc
             finally:
                 cur.close()
                 self.connection_pool.putconn(conn)
+
+    def _run_with_retry(self, fn, commit: bool = False, retries: int = 1):
+        """
+        Run a cursor operation with a small retry for transient connection drops.
+        This reduces user-facing 500s like 'the connection is lost' when the pool
+        returns a stale/broken connection.
+        """
+        last_exc = None
+        attempts = max(0, int(retries)) + 1
+        for attempt in range(attempts):
+            try:
+                with self._get_cursor(commit=commit) as cur:
+                    return fn(cur)
+            except OperationalError as exc:
+                last_exc = exc
+                if attempt < attempts - 1:
+                    logger.warning("Postgres OperationalError, retrying (%s/%s): %s", attempt + 1, attempts, exc)
+                    continue
+                raise
+        raise last_exc
 
     def create_col(self) -> None:
         """
@@ -188,14 +228,14 @@ class PGVector(VectorStoreBase):
         if PSYCOPG_VERSION == 3:
             with self._get_cursor(commit=True) as cur:
                 cur.executemany(
-                    f"INSERT INTO {self.collection_name} (id, vector, payload) VALUES (%s, %s, %s)",
+                    f"INSERT INTO {self.collection_name} (id, vector, payload) VALUES (%s, %s, %s) ON CONFLICT (id) DO NOTHING",
                     data,
                 )
         else:
             with self._get_cursor(commit=True) as cur:
                 execute_values(
                     cur,
-                    f"INSERT INTO {self.collection_name} (id, vector, payload) VALUES %s",
+                    f"INSERT INTO {self.collection_name} (id, vector, payload) VALUES %s ON CONFLICT (id) DO NOTHING",
                     data,
                 )
 
@@ -228,19 +268,20 @@ class PGVector(VectorStoreBase):
 
         filter_clause = "WHERE " + " AND ".join(filter_conditions) if filter_conditions else ""
 
-        with self._get_cursor() as cur:
+        def _do(cur):
             cur.execute(
                 f"""
-                SELECT id, vector <=> %s::vector AS distance, payload
-                FROM {self.collection_name}
-                {filter_clause}
-                ORDER BY distance
-                LIMIT %s
+                    SELECT id, vector <=> %s::vector AS distance, payload
+                    FROM {self.collection_name}
+                    {filter_clause}
+                    ORDER BY distance
+                    LIMIT %s
                 """,
                 (vectors, *filter_params, limit),
             )
+            return cur.fetchall()
 
-            results = cur.fetchall()
+        results = self._run_with_retry(_do, commit=False, retries=1)
         return [OutputData(id=str(r[0]), score=float(r[1]), payload=r[2]) for r in results]
 
     def delete(self, vector_id: str) -> None:
@@ -379,9 +420,13 @@ class PGVector(VectorStoreBase):
             LIMIT %s
         """
 
-        with self._get_cursor() as cur:
+        def _do(cur):
             cur.execute(query, (*filter_params, limit))
-            results = cur.fetchall()
+            return cur.fetchall()
+
+        results = self._run_with_retry(_do, commit=False, retries=1)
+        # Keep backward-compatible return shape: a list containing the results list.
+        # Some callers in mem0 expect `vector_store.list(...)[0]`.
         return [[OutputData(id=str(r[0]), score=None, payload=r[2]) for r in results]]
 
     def __del__(self) -> None:

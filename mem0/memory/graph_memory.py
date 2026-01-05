@@ -373,6 +373,7 @@ class MemoryGraph:
                 "source_name": source,
                 "dest_name": destination,
                 "user_id": user_id,
+                "relationship": relationship,
             }
 
             if agent_id:
@@ -394,10 +395,8 @@ class MemoryGraph:
 
             # Delete the specific relationship between nodes
             cypher = f"""
-            MATCH (n {self.node_label} {{{source_props_str}}})
-            -[r:{relationship}]->
-            (m {self.node_label} {{{dest_props_str}}})
-            
+            MATCH (n {self.node_label} {{{source_props_str}}})-[r]->(m {self.node_label} {{{dest_props_str}}})
+            WHERE type(r) = $relationship
             DELETE r
             RETURN 
                 n.name AS source,
